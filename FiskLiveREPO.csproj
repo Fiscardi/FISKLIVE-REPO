@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <AssemblyName>FiskLiveREPO</AssemblyName>
+    <Description>Mod de R.E.P.O. para FiskLive: recibe comandos por TCP desde la app y los ejecuta en el juego.</Description>
+    <Version>1.0.0</Version>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!-- R.E.P.O. usa BepInEx 5 (Mono), no IL2CPP -->
+    <RestoreAdditionalProjectSources>
+      https://api.nuget.org/v3/index.json
+    </RestoreAdditionalProjectSources>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Framework base de BepInEx 5 para juegos Mono -->
+    <PackageReference Include="BepInEx.Analyzers" Version="1.*" PrivateAssets="all" />
+    <PackageReference Include="BepInEx.Core" Version="5.*" />
+    <PackageReference Include="BepInEx.PluginInfoProps" Version="2.*" />
+
+    <!-- DLLs base de Unity (solo firmas, necesarias para compilar contra UnityEngine) -->
+    <PackageReference Include="UnityEngine.Modules" Version="2022.3.21" IncludeAssets="compile" />
+
+    <!--
+      Librerias "GameLibs" de R.E.P.O.: version publica, generada automaticamente,
+      con las firmas de metodos del juego pero SIN el codigo real (nada de
+      propiedad intelectual de Steam/el estudio). Mantenida por la comunidad
+      de BepInEx via NuGet.org, por eso esto compila en GitHub Actions sin
+      tener que subir ningun archivo del juego al repo.
+      https://www.nuget.org/packages/R.E.P.O.GameLibs.Steam
+    -->
+    <PackageReference Include="R.E.P.O.GameLibs.Steam" Version="0.4.4-ngd.0" IncludeAssets="compile" Private="false" />
+
+    <!-- Libreria de la comunidad para spawnear/registrar contenido de forma segura en multiplayer -->
+    <PackageReference Include="Zehs.REPOLib" Version="1.*" />
+  </ItemGroup>
+
+</Project>
