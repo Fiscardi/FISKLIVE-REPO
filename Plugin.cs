@@ -403,22 +403,29 @@ namespace FiskLiveREPO
             var player = FindLocalPlayer();
             if (player == null) return;
 
-            // PlayerHealth.Heal(int, bool) esta confirmado en el codigo
-            // publico de REPO_UTILS. Puede estar como componente separado
-            // (GetComponent) o como campo/propiedad de PlayerAvatar - probamos
-            // ambos caminos.
-            object healthComponent = TryGetComponentByTypeName(player, "PlayerHealth")
-                                      ?? TryGetFieldOrProperty(player, "playerHealth");
+            // Actualizado tras analizar un mod de referencia ya instalado:
+            // el juego NO tiene una clase simple "PlayerHealth" - maneja la
+            // vida como parte de una familia de componentes "UpgradePlayerX"
+            // (UpgradePlayerHealth, UpgradePlayerEnergy, etc). Probamos
+            // varios nombres candidatos en orden.
+            string[] candidateTypeNames = { "PlayerHealth", "UpgradePlayerHealth" };
+            object healthComponent = null;
+            foreach (var typeName in candidateTypeNames)
+            {
+                healthComponent = TryGetComponentByTypeName(player, typeName);
+                if (healthComponent != null) break;
+            }
+            healthComponent ??= TryGetFieldOrProperty(player, "playerHealth");
 
             if (healthComponent == null)
             {
-                Log.LogError("No se encontro 'PlayerHealth' en el jugador (ni como componente ni como campo 'playerHealth'). Ajustar segun el log del juego.");
+                Log.LogError("No se encontro ningun componente de vida (probamos PlayerHealth, UpgradePlayerHealth, campo playerHealth). Revisar con el juego abierto que otros nombres puede tener.");
                 return;
             }
 
             bool ok = TryInvoke(healthComponent, "Heal", new object[] { amount, false });
-            if (!ok) Log.LogError("No se pudo invocar Heal(int, bool) en PlayerHealth. Puede que la firma real sea distinta.");
-            else Log.LogInfo($"Vida del jugador ajustada en {amount}");
+            if (!ok) Log.LogError($"Se encontro el componente ({healthComponent.GetType().Name}) pero no se pudo invocar Heal(int, bool). Puede que la firma real sea distinta (revisar el log completo del error mas arriba).");
+            else Log.LogInfo($"Vida del jugador ajustada en {amount} via {healthComponent.GetType().Name}");
         }
 
         private void ToggleGodMode()
@@ -426,13 +433,22 @@ namespace FiskLiveREPO
             var player = FindLocalPlayer();
             if (player == null) return;
 
-            // REPO_UTILS implementa "God Mode" combinando varios campos
-            // (SprintSpeed, EnergyCurrent) en vez de un solo booleano.
-            // Como primer paso simple, curamos a full y dejamos un aviso:
-            // esto probablemente haya que expandirlo con mas campos una vez
-            // que probemos en el juego real.
             ApplyHealthDelta(9999);
-            Log.LogWarning("god_mode_toggle: por ahora solo cura al maximo. Falta implementar invencibilidad real (revisar SprintSpeed/EnergyCurrent en PlayerAvatar).");
+
+            // EnergyCurrent esta confirmado como campo real (visto en un mod
+            // de referencia ya instalado). Lo llenamos tambien via reflection,
+            // buscandolo directo en PlayerAvatar o en UpgradePlayerEnergy.
+            object energyHolder = TryGetComponentByTypeName(player, "UpgradePlayerEnergy") ?? player;
+            var field = energyHolder?.GetType().GetField("EnergyCurrent", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (field != null)
+            {
+                field.SetValue(energyHolder, 100f);
+                Log.LogInfo("EnergyCurrent seteado a 100");
+            }
+            else
+            {
+                Log.LogWarning("No se encontro el campo EnergyCurrent en PlayerAvatar ni en UpgradePlayerEnergy.");
+            }
         }
 
         private void TeleportPlayerRandom()
@@ -447,18 +463,27 @@ namespace FiskLiveREPO
                 return;
             }
 
+            // NOTA: un mod de referencia ya instalado tiene una clase propia
+            // llamada "TeleportPlayerPatch" (Harmony) para esto - es señal de
+            // que mover el Transform a mano puede no alcanzar (el juego usa
+            // CharacterController y puede "pisar" la posicion cada frame).
+            // Si esto no se nota en el juego, el siguiente paso es agregar
+            // HarmonyLib como dependencia y patchear en vez de asignar
+            // directo, en lugar de seguir peleando con el Transform.
             Vector3 offset = new Vector3(UnityEngine.Random.Range(-10f, 10f), 0f, UnityEngine.Random.Range(-10f, 10f));
             transform.position += offset;
-            Log.LogInfo($"Jugador teletransportado con offset {offset}");
+            Log.LogInfo($"Jugador teletransportado con offset {offset} (si no se nota nada, revisar nota de Harmony en el codigo)");
         }
 
         private void SpawnEnemy(string enemyName)
         {
-            // Los mods existentes (Enemy Spawner, EnemySpawning) confirman
-            // que esto es posible via EnemyDirector + PhotonNetwork.Instantiate,
-            // pero no tengo los nombres EXACTOS de metodo. Dejamos el intento
-            // con reflection: si falla, el log va a decir exactamente que
-            // metodo no encontro, y ahi ajustamos.
+            // NOTA: un mod de referencia ya instalado tiene una clase propia
+            // llamada "SemiFunc_EnemySpawnPatcher" (Harmony) para esto - o
+            // sea que spawnear un enemigo puntualmente necesita interceptar
+            // la logica de spawn del propio EnemyDirector/SemiFunc, no
+            // alcanza con llamar un metodo suelto por reflection. Dejamos
+            // el chequeo de existencia, pero la implementacion real queda
+            // pendiente de agregar HarmonyLib como dependencia.
             Type enemyDirectorType = FindGameType("EnemyDirector");
             if (enemyDirectorType == null)
             {
@@ -473,7 +498,7 @@ namespace FiskLiveREPO
                 return;
             }
 
-            Log.LogWarning($"spawn_enemy: se encontro EnemyDirector pero todavia no se confirmo el metodo exacto para spawnear '{enemyName ?? "random"}'. Pendiente de ajuste con el juego abierto.");
+            Log.LogWarning($"spawn_enemy: pendiente - esto necesita HarmonyLib (ver SemiFunc_EnemySpawnPatcher en la nota del codigo), no una llamada directa. No implementado todavia para '{enemyName ?? "random"}'.");
         }
 
         private void SetEnemiesFrozen(bool frozen)
