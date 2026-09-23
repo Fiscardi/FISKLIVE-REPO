@@ -63,7 +63,14 @@ namespace FiskLiveREPO
         private void Awake()
         {
             Log = Logger;
-            Log.LogInfo($"{PluginName} cargado, escuchando comandos en el puerto {ListenPort}");
+
+            // R.E.P.O. (como otros juegos Unity) puede destruir el GameObject del
+            // plugin al cargar escenas. Cuando eso pasa se llama OnDestroy, que
+            // cierra el puerto. Esto lo protege para que el plugin sobreviva.
+            gameObject.transform.parent = null;
+            gameObject.hideFlags = HideFlags.HideAndDontSave;
+
+            Log.LogInfo($"{PluginName} cargado, iniciando servidor en el puerto {ListenPort}");
 
             _running = true;
             _listenerThread = new Thread(ListenLoop) { IsBackground = true };
@@ -72,6 +79,8 @@ namespace FiskLiveREPO
 
         private void OnDestroy()
         {
+            // Si este mensaje aparece en el log, el juego destruyo el plugin.
+            Log?.LogWarning("OnDestroy llamado: el plugin fue destruido, se cierra el puerto.");
             _running = false;
             try { _listener?.Stop(); } catch { /* noop */ }
         }
@@ -82,8 +91,15 @@ namespace FiskLiveREPO
         {
             try
             {
+                if (!_running)
+                {
+                    Log.LogWarning("ListenLoop: el plugin ya estaba destruido antes de abrir el puerto.");
+                    return;
+                }
+
                 _listener = new TcpListener(IPAddress.Loopback, ListenPort);
                 _listener.Start();
+                Log.LogInfo($"Puerto abierto: escuchando en 127.0.0.1:{ListenPort}");
 
                 while (_running)
                 {
@@ -103,6 +119,11 @@ namespace FiskLiveREPO
             catch (Exception ex)
             {
                 Log.LogError($"No se pudo abrir el puerto {ListenPort}: {ex.Message}");
+            }
+            finally
+            {
+                try { _listener?.Stop(); } catch { /* noop */ }
+                Log.LogInfo("ListenLoop terminado (el puerto ya no esta abierto).");
             }
         }
 
