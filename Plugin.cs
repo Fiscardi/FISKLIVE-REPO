@@ -254,15 +254,21 @@ namespace FiskLiveREPO
                     TeleportPlayerRandom();
                     break;
 
-                // [NECESITA AJUSTE]
+                // Enemigos e items: via REPOLib (ver seccion "Spawn de enemigos e items")
                 case "spawn_enemy":
-                    SpawnEnemy(ExtractValue(json, "enemy"));
+                    SpawnEnemies(ExtractValue(json, "enemy"), 1);
                     break;
 
-                // [NECESITA AJUSTE]
                 case "enemy_horde":
-                    int count = ExtractInt(json, "count", 4);
-                    for (int i = 0; i < count; i++) SpawnEnemy(null);
+                    SpawnEnemies(ExtractValue(json, "enemy"), ExtractInt(json, "count", 4));
+                    break;
+
+                case "list_enemies":
+                    ListModuleNames("REPOLib.Modules.Enemies", "enemigos", "AllEnemies", "GetEnemies");
+                    break;
+
+                case "list_items":
+                    ListModuleNames("REPOLib.Modules.Items", "items", "AllItems", "GetItems");
                     break;
 
                 // [NECESITA AJUSTE]
@@ -280,9 +286,8 @@ namespace FiskLiveREPO
                     SpawnViaDevCommand("spawnvaluable", ExtractValue(json, "name") ?? "diamond");
                     break;
 
-                // [NECESITA AJUSTE]
                 case "spawn_item":
-                    SpawnViaDevCommand("spawnitem", ExtractValue(json, "name") ?? "gun");
+                    SpawnItems(ExtractValue(json, "name"), ExtractInt(json, "count", 1));
                     break;
 
                 default:
@@ -496,30 +501,332 @@ namespace FiskLiveREPO
             Log.LogInfo($"Jugador teletransportado con offset {offset} (si no se nota nada, revisar nota de Harmony en el codigo)");
         }
 
-        private void SpawnEnemy(string enemyName)
+        // ============================================================
+        // Spawn de enemigos e items (armas) via REPOLib, por reflection
+        // ============================================================
+        // REPOLib es un mod aparte (Thunderstore: Zehs-REPOLib) que tiene que
+        // estar instalado en BepInEx\plugins. Su API sabe spawnear enemigos e
+        // items de forma segura, tambien en singleplayer. Lo llamamos por
+        // reflection para que este mod cargue igual aunque REPOLib no este:
+        // en ese caso solo se loguea un error claro. Si algun nombre de
+        // metodo no coincide, el log muestra los metodos que si existen.
+
+        private static Type FindRepoLibType(string fullName)
         {
-            // NOTA: un mod de referencia ya instalado tiene una clase propia
-            // llamada "SemiFunc_EnemySpawnPatcher" (Harmony) para esto - o
-            // sea que spawnear un enemigo puntualmente necesita interceptar
-            // la logica de spawn del propio EnemyDirector/SemiFunc, no
-            // alcanza con llamar un metodo suelto por reflection. Dejamos
-            // el chequeo de existencia, pero la implementacion real queda
-            // pendiente de agregar HarmonyLib como dependencia.
-            Type enemyDirectorType = FindGameType("EnemyDirector");
-            if (enemyDirectorType == null)
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
-                Log.LogError("No se encontro la clase 'EnemyDirector'. spawn_enemy no implementado todavia.");
+                string asmName;
+                try { asmName = asm.GetName().Name; } catch { continue; }
+                if (!string.Equals(asmName, "REPOLib", StringComparison.OrdinalIgnoreCase)) continue;
+
+                try
+                {
+                    var t = asm.GetType(fullName);
+                    if (t != null) return t;
+                }
+                catch { /* seguimos con el siguiente assembly */ }
+            }
+            return null;
+        }
+
+        // Lee una lista estatica (propiedad o metodo sin parametros) de un
+        // modulo de REPOLib, probando varios nombres posibles en orden.
+        private static List<UnityEngine.Object> GetAllFromModule(Type module, params string[] memberNames)
+        {
+            var result = new List<UnityEngine.Object>();
+            if (module == null) return result;
+
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.Static;
+            foreach (var memberName in memberNames)
+            {
+                object value = null;
+                try
+                {
+                    var prop = module.GetProperty(memberName, flags);
+                    if (prop != null)
+                    {
+                        value = prop.GetValue(null, null);
+                    }
+                    else
+                    {
+                        var method = module.GetMethods(flags)
+                            .FirstOrDefault(m => m.Name == memberName && m.GetParameters().Length == 0);
+                        if (method != null) value = method.Invoke(null, null);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.LogWarning($"No se pudo leer {module.Name}.{memberName}: {ex.Message}");
+                }
+
+                var enumerable = value as System.Collections.IEnumerable;
+                if (enumerable == null) continue;
+
+                foreach (var entry in enumerable)
+                {
+                    var unityObj = entry as UnityEngine.Object;
+                    if (unityObj != null && !result.Contains(unityObj)) result.Add(unityObj);
+                }
+                if (result.Count > 0) break;
+            }
+            return result;
+        }
+
+        // Loguea los metodos publicos de un modulo, para diagnosticar cuando
+        // la API de REPOLib no coincide con lo que esperamos.
+        private static void DescribeModule(Type module)
+        {
+            if (module == null) return;
+            var sb = new StringBuilder();
+            sb.AppendLine($"Metodos publicos de {module.FullName}:");
+            foreach (var m in module.GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly))
+            {
+                var ps = string.Join(", ", m.GetParameters().Select(p => p.ParameterType.Name + " " + p.Name).ToArray());
+                sb.AppendLine($"  {m.ReturnType.Name} {m.Name}({ps})");
+            }
+            Log.LogWarning(sb.ToString());
+        }
+
+        // Elige por nombre: coincidencia exacta, o el nombre mas corto que
+        // contenga el texto. Texto vacio o "random" = uno al azar.
+        private static UnityEngine.Object PickByName(List<UnityEngine.Object> all, string term)
+        {
+            if (all == null || all.Count == 0) return null;
+            if (string.IsNullOrEmpty(term) || term.Equals("random", StringComparison.OrdinalIgnoreCase))
+                return all[UnityEngine.Random.Range(0, all.Count)];
+
+            var exact = all.FirstOrDefault(o => o.name.Equals(term, StringComparison.OrdinalIgnoreCase));
+            if (exact != null) return exact;
+
+            return all
+                .Where(o => o.name.IndexOf(term, StringComparison.OrdinalIgnoreCase) >= 0)
+                .OrderBy(o => o.name.Length)
+                .FirstOrDefault();
+        }
+
+        // Llama a un metodo estatico de REPOLib armando los argumentos segun
+        // los tipos de sus parametros (asi aguanta pequenas diferencias de
+        // firma, por ejemplo un parametro bool opcional de mas).
+        private static object InvokeStatic(Type module, string methodName, params object[] candidates)
+        {
+            var methods = module.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                .Where(m => m.Name == methodName)
+                .OrderByDescending(m => m.GetParameters().Length)
+                .ToList();
+
+            foreach (var method in methods)
+            {
+                var ps = method.GetParameters();
+                var args = new object[ps.Length];
+                bool ok = true;
+
+                for (int i = 0; i < ps.Length; i++)
+                {
+                    object match = null;
+                    foreach (var candidate in candidates)
+                    {
+                        if (candidate != null && ps[i].ParameterType.IsInstanceOfType(candidate))
+                        {
+                            match = candidate;
+                            break;
+                        }
+                    }
+
+                    if (match != null) args[i] = match;
+                    else if (ps[i].HasDefaultValue) args[i] = ps[i].DefaultValue;
+                    else { ok = false; break; }
+                }
+
+                if (!ok) continue;
+
+                try
+                {
+                    return method.Invoke(null, args);
+                }
+                catch (TargetInvocationException tie)
+                {
+                    throw tie.InnerException ?? tie;
+                }
+            }
+
+            throw new MissingMethodException($"{module.Name}.{methodName} no tiene ninguna sobrecarga compatible con los datos que tenemos.");
+        }
+
+        // Punto de spawn alrededor del jugador local. Si snapToGround, baja
+        // hasta el piso con un raycast (los enemigos necesitan estar en el piso).
+        private Vector3? FindSpawnPositionNearPlayer(float minDistance, float maxDistance, bool snapToGround)
+        {
+            object player = null;
+            Type playerType = FindGameType("PlayerAvatar");
+            if (playerType != null)
+            {
+                const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
+                var field = playerType.GetField("instance", flags);
+                if (field != null)
+                {
+                    player = field.GetValue(null);
+                }
+                else
+                {
+                    var prop = playerType.GetProperty("instance", flags);
+                    if (prop != null) player = prop.GetValue(null, null);
+                }
+            }
+
+            var component = player as Component;
+            if (component == null) component = FindLocalPlayer() as Component;
+            if (component == null) return null;
+
+            Vector3 origin = component.transform.position;
+            float angle = UnityEngine.Random.Range(0f, 360f);
+            float distance = UnityEngine.Random.Range(minDistance, maxDistance);
+            Vector3 pos = origin + (Quaternion.Euler(0f, angle, 0f) * Vector3.forward) * distance;
+            pos += Vector3.up * 1f;
+
+            if (snapToGround)
+            {
+                RaycastHit hit;
+                if (Physics.Raycast(pos + Vector3.up * 2f, Vector3.down, out hit, 15f, ~0, QueryTriggerInteraction.Ignore))
+                {
+                    pos = hit.point + Vector3.up * 0.3f;
+                }
+            }
+            return pos;
+        }
+
+        private void SpawnEnemies(string enemyName, int count)
+        {
+            Type module = FindRepoLibType("REPOLib.Modules.Enemies");
+            if (module == null)
+            {
+                Log.LogError("No se encontro REPOLib. Para spawnear enemigos hay que instalar el mod Zehs-REPOLib (Thunderstore) en BepInEx\\plugins.");
                 return;
             }
 
-            var director = FindFirstInstance("EnemyDirector");
-            if (director == null)
+            var all = GetAllFromModule(module, "AllEnemies", "GetEnemies");
+            if (all.Count == 0)
             {
-                Log.LogError("Existe la clase EnemyDirector pero no hay ninguna instancia activa en la escena (¿estamos en una partida?).");
+                Log.LogError("REPOLib no devolvio ninguna lista de enemigos (¿estas dentro de una partida? o la API cambio).");
+                DescribeModule(module);
                 return;
             }
 
-            Log.LogWarning($"spawn_enemy: pendiente - esto necesita HarmonyLib (ver SemiFunc_EnemySpawnPatcher en la nota del codigo), no una llamada directa. No implementado todavia para '{enemyName ?? "random"}'.");
+            count = Mathf.Clamp(count, 1, 20);
+            for (int i = 0; i < count; i++)
+            {
+                var setup = PickByName(all, enemyName);
+                if (setup == null)
+                {
+                    Log.LogWarning($"No hay ningun enemigo que coincida con '{enemyName}'. Disponibles: {string.Join(", ", all.Select(o => o.name).ToArray())}");
+                    return;
+                }
+
+                var pos = FindSpawnPositionNearPlayer(6f, 12f, true);
+                if (pos == null)
+                {
+                    Log.LogError("No se pudo calcular una posicion cerca del jugador.");
+                    return;
+                }
+
+                try
+                {
+                    InvokeStatic(module, "SpawnEnemy", setup, pos.Value, Quaternion.identity, true);
+                    Log.LogInfo($"Enemigo spawneado: {setup.name} en {pos.Value}");
+                }
+                catch (Exception ex)
+                {
+                    Log.LogError($"Fallo SpawnEnemy de REPOLib: {ex.Message}");
+                    DescribeModule(module);
+                    return;
+                }
+            }
+        }
+
+        // itemName: nombre (o parte del nombre) del item, "random" para uno al
+        // azar, o "random_weapon" para un arma al azar (gun / melee / grenade / mine).
+        private void SpawnItems(string itemName, int count)
+        {
+            Type module = FindRepoLibType("REPOLib.Modules.Items");
+            if (module == null)
+            {
+                Log.LogError("No se encontro REPOLib. Para spawnear items hay que instalar el mod Zehs-REPOLib (Thunderstore) en BepInEx\\plugins.");
+                return;
+            }
+
+            var all = GetAllFromModule(module, "AllItems", "GetItems");
+            if (all.Count == 0)
+            {
+                Log.LogError("REPOLib no devolvio ninguna lista de items (¿estas dentro de una partida? o la API cambio).");
+                DescribeModule(module);
+                return;
+            }
+
+            var pool = all;
+            string term = itemName;
+            if (string.Equals(itemName, "random_weapon", StringComparison.OrdinalIgnoreCase))
+            {
+                string[] weaponWords = { "gun", "melee", "grenade", "mine" };
+                pool = all
+                    .Where(o => weaponWords.Any(w => o.name.IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0))
+                    .ToList();
+                term = null;
+                if (pool.Count == 0)
+                {
+                    Log.LogWarning($"No encontre items que parezcan armas. Items disponibles: {string.Join(", ", all.Select(o => o.name).ToArray())}");
+                    return;
+                }
+            }
+
+            count = Mathf.Clamp(count, 1, 20);
+            for (int i = 0; i < count; i++)
+            {
+                var item = PickByName(pool, term);
+                if (item == null)
+                {
+                    Log.LogWarning($"No hay ningun item que coincida con '{itemName}'. Disponibles: {string.Join(", ", all.Select(o => o.name).ToArray())}");
+                    return;
+                }
+
+                var pos = FindSpawnPositionNearPlayer(2f, 4f, false);
+                if (pos == null)
+                {
+                    Log.LogError("No se pudo calcular una posicion cerca del jugador.");
+                    return;
+                }
+
+                try
+                {
+                    InvokeStatic(module, "SpawnItem", item, pos.Value, Quaternion.identity, true);
+                    Log.LogInfo($"Item spawneado: {item.name} en {pos.Value}");
+                }
+                catch (Exception ex)
+                {
+                    Log.LogError($"Fallo SpawnItem de REPOLib: {ex.Message}");
+                    DescribeModule(module);
+                    return;
+                }
+            }
+        }
+
+        // Loguea los nombres disponibles para usar en spawn_enemy / spawn_item.
+        private static void ListModuleNames(string typeName, string label, params string[] memberNames)
+        {
+            Type module = FindRepoLibType(typeName);
+            if (module == null)
+            {
+                Log.LogError("No se encontro REPOLib. Instalar el mod Zehs-REPOLib (Thunderstore) en BepInEx\\plugins.");
+                return;
+            }
+
+            var all = GetAllFromModule(module, memberNames);
+            if (all.Count == 0)
+            {
+                Log.LogWarning($"REPOLib no devolvio la lista de {label}.");
+                DescribeModule(module);
+                return;
+            }
+
+            Log.LogInfo($"Nombres de {label} disponibles ({all.Count}): {string.Join(" | ", all.Select(o => o.name).ToArray())}");
         }
 
         private void SetEnemiesFrozen(bool frozen)
