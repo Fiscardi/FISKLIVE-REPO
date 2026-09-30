@@ -591,35 +591,112 @@ namespace FiskLiveREPO
             }
         }
 
+        private static bool _itemScanDone;
+
+        // Vuelca en el log el contenido de un catalogo (lista de items/valuables)
+        private static void DumpCatalog(string label, object value)
+        {
+            if (!(value is System.Collections.IEnumerable en) || value is string) return;
+
+            int n = 0;
+            var names = new List<string>();
+            foreach (var item in en)
+            {
+                n++;
+                if (names.Count >= 80) continue;
+                string itemName = null;
+                if (item != null)
+                {
+                    var inner = TryGetFieldOrProperty(item, "itemName");
+                    itemName = inner != null ? inner.ToString() : null;
+                }
+                string unityName = (item as UnityEngine.Object) != null ? ((UnityEngine.Object)item).name : (item != null ? item.ToString() : "null");
+                names.Add(itemName != null ? $"{unityName} [{itemName}]" : unityName);
+            }
+            Log.LogInfo($"[scan items] {label}: {n} elementos");
+            foreach (var nm in names) Log.LogInfo($"[scan items]     - {nm}");
+        }
+
         private void GiveWeapon(string weaponName)
         {
-            var player = FindLocalPlayer();
-            var playerTransform = player != null ? TryGetTransform(player) : null;
-            if (playerTransform == null)
+            if (_itemScanDone)
             {
-                Log.LogError("give_weapon: no se encontro el transform del jugador.");
+                Log.LogInfo("give_weapon: el escaneo ya se hizo en esta sesion, revisa el log anterior.");
                 return;
             }
+            _itemScanDone = true;
 
-            // Por lo que se ve en las clases del juego (PhysGrabObject,
-            // ItemToggle, etc), las armas/items aca no son un "inventario"
-            // clasico: son objetos fisicos que el jugador agarra. Por eso,
-            // en vez de "dar" el arma directamente a una lista interna, la
-            // spawneamos justo enfrente del jugador para que la levante.
-            Vector3 spawnPos = playerTransform.position + playerTransform.forward * 1.5f + Vector3.up * 0.5f;
-            string prefabName = string.IsNullOrEmpty(weaponName) ? "Items/Gun" : $"Items/{weaponName}";
+            const BindingFlags decl = BindingFlags.Public | BindingFlags.Static | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+            const BindingFlags all = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+            Log.LogInfo($"[scan items] pedido: '{weaponName ?? "(ninguno)"}'");
 
-            bool ok = TryInvokeStatic("PhotonNetwork", "Instantiate",
-                new object[] { prefabName, spawnPos, Quaternion.identity }, out _);
+            // 1) Estado de red: solitario vs multijugador
+            Type photonType = FindGameType("PhotonNetwork");
+            Log.LogInfo($"[scan items] Photon -> InRoom={GetStaticProp(photonType, "InRoom")}, OfflineMode={GetStaticProp(photonType, "OfflineMode")}, IsMasterClient={GetStaticProp(photonType, "IsMasterClient")}");
 
-            if (ok)
+            Type semiFuncType = FindGameType("SemiFunc");
+            if (semiFuncType != null)
             {
-                Log.LogInfo($"give_weapon: PhotonNetwork.Instantiate('{prefabName}') se llamo sin excepcion, deberia aparecer justo enfrente tuyo.");
+                foreach (var name in new[] { "IsMultiplayer", "IsMasterClient", "IsMasterClientOrSingleplayer" })
+                {
+                    try
+                    {
+                        var m = semiFuncType.GetMethod(name, BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
+                        if (m != null) Log.LogInfo($"[scan items] SemiFunc.{name}() = {m.Invoke(null, null)}");
+                    }
+                    catch (Exception ex) { Log.LogInfo($"[scan items] SemiFunc.{name}() fallo: {ex.InnerException?.Message ?? ex.Message}"); }
+                }
+
+                // 2) Metodos de SemiFunc relacionados con items
+                foreach (var m in semiFuncType.GetMethods(all).Where(m => m.Name.IndexOf("item", StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    string paramList = string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"));
+                    Log.LogInfo($"[scan items] SemiFunc: {m.ReturnType.Name} {m.Name}({paramList})");
+                }
             }
-            else
+
+            // 3) La clase Item del juego
+            Type itemType = FindGameType("Item");
+            if (itemType != null)
             {
-                Log.LogWarning($"give_weapon: no se pudo instanciar '{prefabName}'. Hay que confirmar el nombre real del prefab del arma dentro de Resources (probar sin el prefijo 'Items/', u otro nombre de carpeta).");
+                Log.LogInfo($"[scan items] tipo Item = {itemType.FullName}, base = {itemType.BaseType?.Name}");
+                foreach (var f in itemType.GetFields(all))
+                    Log.LogInfo($"[scan items] Item.{f.Name} : {f.FieldType.Name}");
             }
+
+            // 4) REPOLib: tipos de items/valuables/prefabs, sus metodos y catalogos
+            string[] keys = { "item", "valuable", "prefab" };
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                if (asm.GetName().Name.IndexOf("REPOLib", StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                Type[] types;
+                try { types = asm.GetTypes(); }
+                catch (ReflectionTypeLoadException ex) { types = ex.Types.Where(t => t != null).ToArray(); }
+
+                foreach (var t in types.Where(t => !t.Name.StartsWith("<") && keys.Any(k => t.Name.IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0)))
+                {
+                    Log.LogInfo($"[scan items] REPOLib tipo: {t.FullName}");
+                    foreach (var m in t.GetMethods(decl).Where(m => !m.IsSpecialName || m.Name.StartsWith("get_")))
+                    {
+                        string paramList = string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"));
+                        Log.LogInfo($"[scan items]   {(m.IsStatic ? "static " : "")}{m.ReturnType.Name} {m.Name}({paramList})");
+                    }
+
+                    // Volcar catalogos: propiedades/metodos estaticos sin parametros que devuelvan listas
+                    foreach (var p in t.GetProperties(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly).Where(p => p.GetIndexParameters().Length == 0))
+                    {
+                        try { DumpCatalog($"{t.Name}.{p.Name}", p.GetValue(null, null)); } catch { /* ignorar */ }
+                    }
+                    foreach (var m in t.GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly)
+                        .Where(m => m.Name.StartsWith("Get") && !m.IsSpecialName && m.GetParameters().Length == 0))
+                    {
+                        try { DumpCatalog($"{t.Name}.{m.Name}()", m.Invoke(null, null)); } catch { /* ignorar */ }
+                    }
+                }
+            }
+
+            Log.LogInfo("[scan items] listo. Pasame todas las lineas que empiezan con [scan items].");
         }
 
         private void SetEnemiesFrozen(bool frozen)
