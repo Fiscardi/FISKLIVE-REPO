@@ -266,7 +266,7 @@ namespace FiskLiveREPO
 
                 // [NECESITA AJUSTE]
                 case "spawn_item":
-                    SpawnViaDevCommand("spawnitem", ExtractValue(json, "name") ?? "gun");
+                    SpawnItemByName(ExtractValue(json, "name"), "Gun");
                     break;
 
                 default:
@@ -385,7 +385,15 @@ namespace FiskLiveREPO
             Type t = FindGameType(typeName);
             if (t == null) return null;
             var results = Resources.FindObjectsOfTypeAll(t);
-            return results != null && results.Length > 0 ? results[0] as UnityEngine.Object : null;
+            if (results == null || results.Length == 0) return null;
+
+            // FindObjectsOfTypeAll tambien devuelve prefabs (que no estan en la
+            // escena). Preferimos la primera instancia que este realmente en escena.
+            foreach (var r in results)
+            {
+                if (r is Component c && c.gameObject.scene.IsValid()) return r;
+            }
+            return results[0];
         }
 
         // Intenta encontrar el jugador local. "PlayerAvatar" es el nombre de
@@ -591,112 +599,103 @@ namespace FiskLiveREPO
             }
         }
 
-        private static bool _itemScanDone;
-
-        // Vuelca en el log el contenido de un catalogo (lista de items/valuables)
-        private static void DumpCatalog(string label, object value)
-        {
-            if (!(value is System.Collections.IEnumerable en) || value is string) return;
-
-            int n = 0;
-            var names = new List<string>();
-            foreach (var item in en)
-            {
-                n++;
-                if (names.Count >= 80) continue;
-                string itemName = null;
-                if (item != null)
-                {
-                    var inner = TryGetFieldOrProperty(item, "itemName");
-                    itemName = inner != null ? inner.ToString() : null;
-                }
-                string unityName = (item as UnityEngine.Object) != null ? ((UnityEngine.Object)item).name : (item != null ? item.ToString() : "null");
-                names.Add(itemName != null ? $"{unityName} [{itemName}]" : unityName);
-            }
-            Log.LogInfo($"[scan items] {label}: {n} elementos");
-            foreach (var nm in names) Log.LogInfo($"[scan items]     - {nm}");
-        }
-
+        // Spawn de items via REPOLib.Modules.Items (confirmado por el escaneo:
+        // tiene AllItems y SpawnItem, y funciona en solitario y multijugador).
         private void GiveWeapon(string weaponName)
         {
-            if (_itemScanDone)
+            SpawnItemByName(weaponName, "Gun");
+        }
+
+        // Busca en el catalogo por nombre. Cada item tiene dos nombres:
+        // el interno ("Item Gun Handgun") y el visible ("Gun"). Acepta cualquiera,
+        // sin importar mayusculas. Prioriza coincidencia exacta sobre "contiene".
+        private static UnityEngine.Object FindItemByName(List<UnityEngine.Object> catalog, string query)
+        {
+            string q = query.Trim();
+            const string prefix = "Item ";
+
+            // 1) Exacto: nombre visible, nombre interno, o interno sin "Item "
+            foreach (var o in catalog)
             {
-                Log.LogInfo("give_weapon: el escaneo ya se hizo en esta sesion, revisa el log anterior.");
+                string shown = TryGetFieldOrProperty(o, "itemName") as string ?? "";
+                string internalName = o.name;
+                string shortInternal = internalName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ? internalName.Substring(prefix.Length) : internalName;
+                if (shown.Equals(q, StringComparison.OrdinalIgnoreCase)
+                    || internalName.Equals(q, StringComparison.OrdinalIgnoreCase)
+                    || shortInternal.Equals(q, StringComparison.OrdinalIgnoreCase))
+                    return o;
+            }
+
+            // 2) Contiene (nombre visible primero, despues el interno)
+            foreach (var o in catalog)
+            {
+                string shown = TryGetFieldOrProperty(o, "itemName") as string ?? "";
+                if (shown.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0) return o;
+            }
+            foreach (var o in catalog)
+            {
+                if (o.name.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0) return o;
+            }
+            return null;
+        }
+
+        private void SpawnItemByName(string query, string defaultName)
+        {
+            Type itemsType = FindGameType("REPOLib.Modules.Items");
+            if (itemsType == null)
+            {
+                Log.LogError("spawn item: no se encontro REPOLib.Modules.Items (¿REPOLib esta instalado y cargado?).");
                 return;
             }
-            _itemScanDone = true;
 
-            const BindingFlags decl = BindingFlags.Public | BindingFlags.Static | BindingFlags.Instance | BindingFlags.DeclaredOnly;
-            const BindingFlags all = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
-            Log.LogInfo($"[scan items] pedido: '{weaponName ?? "(ninguno)"}'");
+            string q = string.IsNullOrWhiteSpace(query) ? defaultName : query;
 
-            // 1) Estado de red: solitario vs multijugador
-            Type photonType = FindGameType("PhotonNetwork");
-            Log.LogInfo($"[scan items] Photon -> InRoom={GetStaticProp(photonType, "InRoom")}, OfflineMode={GetStaticProp(photonType, "OfflineMode")}, IsMasterClient={GetStaticProp(photonType, "IsMasterClient")}");
-
-            Type semiFuncType = FindGameType("SemiFunc");
-            if (semiFuncType != null)
+            var catalog = new List<UnityEngine.Object>();
+            var prop = itemsType.GetProperty("AllItems", BindingFlags.Public | BindingFlags.Static);
+            if (prop?.GetValue(null, null) is System.Collections.IEnumerable en)
             {
-                foreach (var name in new[] { "IsMultiplayer", "IsMasterClient", "IsMasterClientOrSingleplayer" })
+                foreach (var entry in en)
                 {
-                    try
-                    {
-                        var m = semiFuncType.GetMethod(name, BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
-                        if (m != null) Log.LogInfo($"[scan items] SemiFunc.{name}() = {m.Invoke(null, null)}");
-                    }
-                    catch (Exception ex) { Log.LogInfo($"[scan items] SemiFunc.{name}() fallo: {ex.InnerException?.Message ?? ex.Message}"); }
-                }
-
-                // 2) Metodos de SemiFunc relacionados con items
-                foreach (var m in semiFuncType.GetMethods(all).Where(m => m.Name.IndexOf("item", StringComparison.OrdinalIgnoreCase) >= 0))
-                {
-                    string paramList = string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"));
-                    Log.LogInfo($"[scan items] SemiFunc: {m.ReturnType.Name} {m.Name}({paramList})");
+                    if (entry is UnityEngine.Object o) catalog.Add(o);
                 }
             }
 
-            // 3) La clase Item del juego
-            Type itemType = FindGameType("Item");
-            if (itemType != null)
+            var item = FindItemByName(catalog, q);
+            if (item == null)
             {
-                Log.LogInfo($"[scan items] tipo Item = {itemType.FullName}, base = {itemType.BaseType?.Name}");
-                foreach (var f in itemType.GetFields(all))
-                    Log.LogInfo($"[scan items] Item.{f.Name} : {f.FieldType.Name}");
+                Log.LogWarning($"spawn item: no se encontro ningun item que coincida con '{q}'. Items disponibles ({catalog.Count}):");
+                foreach (var o in catalog) Log.LogWarning($"  - {TryGetFieldOrProperty(o, "itemName")} ({o.name})");
+                return;
             }
 
-            // 4) REPOLib: tipos de items/valuables/prefabs, sus metodos y catalogos
-            string[] keys = { "item", "valuable", "prefab" };
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            var player = FindLocalPlayer();
+            var playerTransform = player != null ? TryGetTransform(player) : null;
+            if (playerTransform == null)
             {
-                if (asm.GetName().Name.IndexOf("REPOLib", StringComparison.OrdinalIgnoreCase) < 0) continue;
-
-                Type[] types;
-                try { types = asm.GetTypes(); }
-                catch (ReflectionTypeLoadException ex) { types = ex.Types.Where(t => t != null).ToArray(); }
-
-                foreach (var t in types.Where(t => !t.Name.StartsWith("<") && keys.Any(k => t.Name.IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0)))
-                {
-                    Log.LogInfo($"[scan items] REPOLib tipo: {t.FullName}");
-                    foreach (var m in t.GetMethods(decl).Where(m => !m.IsSpecialName || m.Name.StartsWith("get_")))
-                    {
-                        string paramList = string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"));
-                        Log.LogInfo($"[scan items]   {(m.IsStatic ? "static " : "")}{m.ReturnType.Name} {m.Name}({paramList})");
-                    }
-
-                    // Volcar catalogos: propiedades/metodos estaticos sin parametros que devuelvan listas
-                    foreach (var p in t.GetProperties(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly).Where(p => p.GetIndexParameters().Length == 0))
-                    {
-                        try { DumpCatalog($"{t.Name}.{p.Name}", p.GetValue(null, null)); } catch { /* ignorar */ }
-                    }
-                    foreach (var m in t.GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly)
-                        .Where(m => m.Name.StartsWith("Get") && !m.IsSpecialName && m.GetParameters().Length == 0))
-                    {
-                        try { DumpCatalog($"{t.Name}.{m.Name}()", m.Invoke(null, null)); } catch { /* ignorar */ }
-                    }
-                }
+                Log.LogError("spawn item: no se encontro el transform del jugador.");
+                return;
             }
 
-            Log.LogInfo("[scan items] listo. Pasame todas las lineas que empiezan con [scan items].");
+            // Justo enfrente del jugador, para que lo levante.
+            Vector3 spawnPos = playerTransform.position + playerTransform.forward * 1.5f + Vector3.up * 0.5f;
+
+            var spawn = itemsType.GetMethod("SpawnItem", BindingFlags.Public | BindingFlags.Static);
+            if (spawn == null)
+            {
+                Log.LogError("spawn item: REPOLib.Modules.Items no tiene el metodo SpawnItem.");
+                return;
+            }
+
+            try
+            {
+                object result = spawn.Invoke(null, new object[] { item, spawnPos, Quaternion.identity });
+                var go = result as UnityEngine.Object;
+                Log.LogInfo($"spawn item: '{TryGetFieldOrProperty(item, "itemName")}' ({item.name}) spawneado en {spawnPos}. Objeto creado: {(go != null ? go.name : "null")}");
+            }
+            catch (Exception ex)
+            {
+                Log.LogError($"spawn item: fallo al spawnear '{item.name}': {ex.InnerException?.Message ?? ex.Message}");
+            }
         }
 
         private void SetEnemiesFrozen(bool frozen)
