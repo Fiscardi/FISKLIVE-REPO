@@ -526,6 +526,26 @@ namespace FiskLiveREPO
                     Log.LogInfo($"[diagnostico spawn_enemy] EnemyDirector tiene: {m.ReturnType.Name} {m.Name}({paramList})");
                 }
             }
+
+            // EnemyDirector casi no tiene metodos de spawn propios (solo
+            // administra puntos de spawn) - la logica real probablemente
+            // vive en SemiFunc, la clase helper estatica central del juego
+            // (coincide con el nombre "SemiFunc_EnemySpawnPatcher" visto en
+            // el mod de referencia). Escaneamos esa tambien.
+            Type semiFuncType = FindGameType("SemiFunc");
+            if (semiFuncType != null)
+            {
+                var semiFuncMethods = semiFuncType
+                    .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+                    .Where(m => m.Name.IndexOf("spawn", StringComparison.OrdinalIgnoreCase) >= 0
+                             && m.Name.IndexOf("enem", StringComparison.OrdinalIgnoreCase) >= 0);
+
+                foreach (var m in semiFuncMethods)
+                {
+                    string paramList = string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"));
+                    Log.LogInfo($"[diagnostico spawn_enemy] SemiFunc tiene: {m.ReturnType.Name} {m.Name}({paramList})");
+                }
+            }
         }
 
         private void GiveWeapon(string weaponName)
@@ -638,25 +658,50 @@ namespace FiskLiveREPO
                 return false;
             }
 
-            var method = t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
-                .FirstOrDefault(m => m.Name == methodName && m.GetParameters().Length == args.Length);
+            // Antes exigiamos coincidencia EXACTA de cantidad de parametros,
+            // pero metodos como PhotonNetwork.Instantiate suelen tener MAS
+            // parametros de los que mandamos, con los ultimos opcionales
+            // (con valor por defecto). Ahora aceptamos cualquier metodo con
+            // al menos tantos parametros como argumentos mandamos, siempre
+            // que el resto tenga un default declarado.
+            var candidates = t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+                .Where(m => m.Name == methodName && m.GetParameters().Length >= args.Length)
+                .OrderBy(m => m.GetParameters().Length);
 
-            if (method == null)
+            foreach (var method in candidates)
             {
-                Log.LogError($"'{typeName}' existe pero no tiene un metodo estatico '{methodName}' con {args.Length} parametros.");
-                return false;
+                var parameters = method.GetParameters();
+                bool restAreOptional = true;
+                for (int i = args.Length; i < parameters.Length; i++)
+                {
+                    if (!parameters[i].HasDefaultValue) { restAreOptional = false; break; }
+                }
+                if (!restAreOptional) continue;
+
+                var fullArgs = new object[parameters.Length];
+                Array.Copy(args, fullArgs, args.Length);
+                for (int i = args.Length; i < parameters.Length; i++)
+                {
+                    fullArgs[i] = parameters[i].DefaultValue;
+                }
+
+                string sig = string.Join(", ", parameters.Select(p => p.ParameterType.Name));
+                Log.LogInfo($"Probando {typeName}.{methodName}({sig})");
+
+                try
+                {
+                    result = method.Invoke(null, fullArgs);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Log.LogError($"Invoke estatico de {typeName}.{methodName} fallo: {ex.InnerException?.Message ?? ex.Message}");
+                    return false;
+                }
             }
 
-            try
-            {
-                result = method.Invoke(null, args);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Log.LogError($"Invoke estatico de {typeName}.{methodName} fallo: {ex.InnerException?.Message ?? ex.Message}");
-                return false;
-            }
+            Log.LogError($"'{typeName}' no tiene ningun metodo estatico '{methodName}' compatible con {args.Length} argumentos (probando tambien con parametros extra opcionales).");
+            return false;
         }
     }
 }
