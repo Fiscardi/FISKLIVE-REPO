@@ -497,6 +497,33 @@ namespace FiskLiveREPO
             return list;
         }
 
+        // Busca en el catalogo por nombre, sin usar el metodo obsoleto de REPOLib.
+        // Acepta "Duck" o "Enemy - Duck". Prefiere enemigos individuales sobre grupos.
+        private static UnityEngine.Object FindEnemyByName(List<UnityEngine.Object> catalog, string query)
+        {
+            string q = query.Trim();
+            const string prefix = "Enemy - ";
+
+            // 1) Nombre exacto (con o sin el prefijo "Enemy - ")
+            foreach (var o in catalog)
+            {
+                string n = o.name;
+                string shortName = n.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ? n.Substring(prefix.Length) : n;
+                if (n.Equals(q, StringComparison.OrdinalIgnoreCase) || shortName.Equals(q, StringComparison.OrdinalIgnoreCase))
+                    return o;
+            }
+
+            // 2) Que contenga el texto, prefiriendo los que no son "Group"
+            UnityEngine.Object groupMatch = null;
+            foreach (var o in catalog)
+            {
+                if (o.name.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                if (o.name.IndexOf("Group", StringComparison.OrdinalIgnoreCase) < 0) return o;
+                if (groupMatch == null) groupMatch = o;
+            }
+            return groupMatch;
+        }
+
         private static object GetStaticProp(Type t, string name)
         {
             try { return t?.GetProperty(name, BindingFlags.Public | BindingFlags.Static)?.GetValue(null, null); }
@@ -527,13 +554,7 @@ namespace FiskLiveREPO
             }
             else
             {
-                var tryGet = enemiesType.GetMethod("TryGetEnemyThatContainsName", BindingFlags.Public | BindingFlags.Static);
-                if (tryGet != null)
-                {
-                    var args = new object[] { enemyName, null };
-                    bool found = (bool)tryGet.Invoke(null, args);
-                    if (found) setup = args[1] as UnityEngine.Object;
-                }
+                setup = FindEnemyByName(catalog, enemyName);
             }
 
             if (setup == null)
