@@ -240,8 +240,7 @@ namespace FiskLiveREPO
 
                 // [NECESITA AJUSTE]
                 case "enemy_horde":
-                    int count = ExtractInt(json, "count", 4);
-                    for (int i = 0; i < count; i++) SpawnEnemy(null);
+                    SpawnEnemies(ExtractValue(json, "enemy"), ExtractInt(json, "count", 4));
                     break;
 
                 // [NECESITA AJUSTE]
@@ -266,7 +265,7 @@ namespace FiskLiveREPO
 
                 // [NECESITA AJUSTE]
                 case "spawn_item":
-                    SpawnItemByName(ExtractValue(json, "name"), "Gun");
+                    SpawnItemByName(ExtractValue(json, "name"), "Gun", ExtractInt(json, "count", 1));
                     break;
 
                 default:
@@ -540,6 +539,15 @@ namespace FiskLiveREPO
 
         private void SpawnEnemy(string enemyName)
         {
+            SpawnEnemies(enemyName, 1);
+        }
+
+        // enemyName: nombre o parte del nombre; vacio o "random" = al azar.
+        // count > 1 = horda (del mismo enemigo, o de enemigos distintos si es al azar).
+        private void SpawnEnemies(string enemyName, int count)
+        {
+            count = Mathf.Clamp(count, 1, 30);
+
             Type enemiesType = FindGameType("REPOLib.Modules.Enemies");
             if (enemiesType == null)
             {
@@ -547,39 +555,39 @@ namespace FiskLiveREPO
                 return;
             }
 
-            // Diagnostico: estado de Photon. No bloqueamos nada: si no sos el
-            // host, REPOLib/el juego lo va a rechazar y lo vemos en el log.
-            Type photonType = FindGameType("PhotonNetwork");
-            Log.LogInfo($"spawn_enemy: Photon -> IsMasterClient={GetStaticProp(photonType, "IsMasterClient")}, InRoom={GetStaticProp(photonType, "InRoom")}, OfflineMode={GetStaticProp(photonType, "OfflineMode")}");
-
-            // 1) Elegir el EnemySetup
-            UnityEngine.Object setup = null;
             var catalog = GetEnemyCatalog(enemiesType);
-
-            if (string.IsNullOrEmpty(enemyName))
+            if (catalog.Count == 0)
             {
-                if (catalog.Count > 0) setup = catalog[UnityEngine.Random.Range(0, catalog.Count)];
-            }
-            else
-            {
-                setup = FindEnemyByName(catalog, enemyName);
-            }
-
-            if (setup == null)
-            {
-                Log.LogWarning($"spawn_enemy: no se encontro ningun enemigo que contenga '{enemyName ?? "(al azar)"}'. Enemigos disponibles ({catalog.Count}):");
-                foreach (var o in catalog) Log.LogWarning($"  - {o.name}");
+                Log.LogWarning("spawn_enemy: el catalogo de enemigos esta vacio (¿estas dentro de una partida?).");
                 return;
             }
 
-            // 2) Posicion: 4 metros adelante del jugador
+            bool random = string.IsNullOrWhiteSpace(enemyName)
+                          || enemyName.Trim().Equals("random", StringComparison.OrdinalIgnoreCase);
+
+            // Para "random" usamos solo enemigos individuales: los "Group" ya son
+            // hordas de por si y multiplicarian (ej. "Group - 10 Gnomes" x 5).
+            var randomPool = catalog.Where(o => o.name.IndexOf("Group", StringComparison.OrdinalIgnoreCase) < 0).ToList();
+            if (randomPool.Count == 0) randomPool = catalog;
+
+            UnityEngine.Object fixedSetup = null;
+            if (!random)
+            {
+                fixedSetup = FindEnemyByName(catalog, enemyName);
+                if (fixedSetup == null)
+                {
+                    Log.LogWarning($"spawn_enemy: no se encontro ningun enemigo que contenga '{enemyName}'. Enemigos disponibles ({catalog.Count}):");
+                    foreach (var o in catalog) Log.LogWarning($"  - {o.name}");
+                    return;
+                }
+            }
+
             var player = FindLocalPlayer();
             var playerTransform = player != null ? TryGetTransform(player) : null;
-            Vector3 spawnPos = playerTransform != null
+            Vector3 basePos = playerTransform != null
                 ? playerTransform.position + playerTransform.forward * 4f + Vector3.up * 0.2f
                 : Vector3.zero;
 
-            // 3) Spawnear: SpawnEnemy(EnemySetup, Vector3, Quaternion, bool spawnDespawned)
             var spawn = enemiesType.GetMethod("SpawnEnemy", BindingFlags.Public | BindingFlags.Static);
             if (spawn == null)
             {
@@ -587,15 +595,25 @@ namespace FiskLiveREPO
                 return;
             }
 
-            try
+            for (int i = 0; i < count; i++)
             {
-                object result = spawn.Invoke(null, new object[] { setup, spawnPos, Quaternion.identity, false });
-                int count = result is System.Collections.ICollection col ? col.Count : -1;
-                Log.LogInfo($"spawn_enemy: '{setup.name}' spawneado en {spawnPos} (objetos devueltos: {count}).");
-            }
-            catch (Exception ex)
-            {
-                Log.LogError($"spawn_enemy: fallo al spawnear '{setup.name}': {ex.InnerException?.Message ?? ex.Message}");
+                var setup = random ? randomPool[UnityEngine.Random.Range(0, randomPool.Count)] : fixedSetup;
+
+                // Del segundo en adelante, un pequeño desplazamiento para que no nazcan apilados.
+                Vector3 pos = i == 0
+                    ? basePos
+                    : basePos + new Vector3(UnityEngine.Random.Range(-2.5f, 2.5f), 0f, UnityEngine.Random.Range(-2.5f, 2.5f));
+
+                try
+                {
+                    object result = spawn.Invoke(null, new object[] { setup, pos, Quaternion.identity, false });
+                    int n = result is System.Collections.ICollection col ? col.Count : -1;
+                    Log.LogInfo($"spawn_enemy ({i + 1}/{count}): '{setup.name}' spawneado en {pos} (objetos devueltos: {n}).");
+                }
+                catch (Exception ex)
+                {
+                    Log.LogError($"spawn_enemy: fallo al spawnear '{setup.name}': {ex.InnerException?.Message ?? ex.Message}");
+                }
             }
         }
 
@@ -639,8 +657,12 @@ namespace FiskLiveREPO
             return null;
         }
 
-        private void SpawnItemByName(string query, string defaultName)
+        // query: nombre o parte del nombre; vacio = defaultName;
+        // "random" = item al azar; "random_weapon" = arma al azar.
+        private void SpawnItemByName(string query, string defaultName, int count = 1)
         {
+            count = Mathf.Clamp(count, 1, 30);
+
             Type itemsType = FindGameType("REPOLib.Modules.Items");
             if (itemsType == null)
             {
@@ -648,7 +670,7 @@ namespace FiskLiveREPO
                 return;
             }
 
-            string q = string.IsNullOrWhiteSpace(query) ? defaultName : query;
+            string q = string.IsNullOrWhiteSpace(query) ? defaultName : query.Trim();
 
             var catalog = new List<UnityEngine.Object>();
             var prop = itemsType.GetProperty("AllItems", BindingFlags.Public | BindingFlags.Static);
@@ -659,13 +681,41 @@ namespace FiskLiveREPO
                     if (entry is UnityEngine.Object o) catalog.Add(o);
                 }
             }
-
-            var item = FindItemByName(catalog, q);
-            if (item == null)
+            if (catalog.Count == 0)
             {
-                Log.LogWarning($"spawn item: no se encontro ningun item que coincida con '{q}'. Items disponibles ({catalog.Count}):");
-                foreach (var o in catalog) Log.LogWarning($"  - {TryGetFieldOrProperty(o, "itemName")} ({o.name})");
+                Log.LogWarning("spawn item: el catalogo de items esta vacio (¿estas dentro de una partida?).");
                 return;
+            }
+
+            // Que item (o pool de items) vamos a usar
+            List<UnityEngine.Object> pool = null;
+            UnityEngine.Object fixedItem = null;
+
+            if (q.Equals("random", StringComparison.OrdinalIgnoreCase))
+            {
+                pool = catalog;
+            }
+            else if (q.Equals("random_weapon", StringComparison.OrdinalIgnoreCase))
+            {
+                // Armas = pistolas/escopetas, cuerpo a cuerpo, granadas y minas
+                // (nombres internos: "Item Gun ...", "Item Melee ...", etc).
+                string[] weaponPrefixes = { "Item Gun ", "Item Melee ", "Item Grenade ", "Item Mine " };
+                pool = catalog.Where(o => weaponPrefixes.Any(p => o.name.StartsWith(p, StringComparison.OrdinalIgnoreCase))).ToList();
+                if (pool.Count == 0)
+                {
+                    Log.LogWarning("spawn item: no se encontraron armas en el catalogo para 'random_weapon'.");
+                    return;
+                }
+            }
+            else
+            {
+                fixedItem = FindItemByName(catalog, q);
+                if (fixedItem == null)
+                {
+                    Log.LogWarning($"spawn item: no se encontro ningun item que coincida con '{q}'. Items disponibles ({catalog.Count}):");
+                    foreach (var o in catalog) Log.LogWarning($"  - {TryGetFieldOrProperty(o, "itemName")} ({o.name})");
+                    return;
+                }
             }
 
             var player = FindLocalPlayer();
@@ -677,7 +727,7 @@ namespace FiskLiveREPO
             }
 
             // Justo enfrente del jugador, para que lo levante.
-            Vector3 spawnPos = playerTransform.position + playerTransform.forward * 1.5f + Vector3.up * 0.5f;
+            Vector3 basePos = playerTransform.position + playerTransform.forward * 1.5f + Vector3.up * 0.5f;
 
             var spawn = itemsType.GetMethod("SpawnItem", BindingFlags.Public | BindingFlags.Static);
             if (spawn == null)
@@ -686,15 +736,25 @@ namespace FiskLiveREPO
                 return;
             }
 
-            try
+            for (int i = 0; i < count; i++)
             {
-                object result = spawn.Invoke(null, new object[] { item, spawnPos, Quaternion.identity });
-                var go = result as UnityEngine.Object;
-                Log.LogInfo($"spawn item: '{TryGetFieldOrProperty(item, "itemName")}' ({item.name}) spawneado en {spawnPos}. Objeto creado: {(go != null ? go.name : "null")}");
-            }
-            catch (Exception ex)
-            {
-                Log.LogError($"spawn item: fallo al spawnear '{item.name}': {ex.InnerException?.Message ?? ex.Message}");
+                var item = fixedItem ?? pool[UnityEngine.Random.Range(0, pool.Count)];
+
+                // Del segundo en adelante, un pequeño desplazamiento para que no nazcan apilados.
+                Vector3 pos = i == 0
+                    ? basePos
+                    : basePos + new Vector3(UnityEngine.Random.Range(-0.8f, 0.8f), 0f, UnityEngine.Random.Range(-0.8f, 0.8f));
+
+                try
+                {
+                    object result = spawn.Invoke(null, new object[] { item, pos, Quaternion.identity });
+                    var go = result as UnityEngine.Object;
+                    Log.LogInfo($"spawn item ({i + 1}/{count}): '{TryGetFieldOrProperty(item, "itemName")}' ({item.name}) spawneado en {pos}. Objeto creado: {(go != null ? go.name : "null")}");
+                }
+                catch (Exception ex)
+                {
+                    Log.LogError($"spawn item: fallo al spawnear '{item.name}': {ex.InnerException?.Message ?? ex.Message}");
+                }
             }
         }
 
