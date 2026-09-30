@@ -480,72 +480,108 @@ namespace FiskLiveREPO
             Log.LogInfo($"Jugador teletransportado con offset {offset} (si no se nota nada, revisar nota de Harmony en el codigo)");
         }
 
+        private static bool _enemyScanDone;
+
         private void SpawnEnemy(string enemyName)
         {
-            var player = FindLocalPlayer();
-            var playerTransform = player != null ? TryGetTransform(player) : null;
-            Vector3 spawnPos = playerTransform != null
-                ? playerTransform.position + playerTransform.forward * 4f
-                : Vector3.zero;
-
-            // PhotonNetwork.Instantiate es API ESTANDAR de Photon (no
-            // especifica de R.E.P.O.), asi que la llamada en si la sabemos
-            // segura. Lo que NO podemos confirmar sin el juego abierto es
-            // el nombre/ruta exacto del prefab dentro de la carpeta
-            // Resources - "Enemies/<nombre>" es una convencion COMUN en
-            // juegos con Photon, pero puede que R.E.P.O. use otra.
-            string prefabName = string.IsNullOrEmpty(enemyName) ? "Enemies/Random" : $"Enemies/{enemyName}";
-
-            bool ok = TryInvokeStatic("PhotonNetwork", "Instantiate",
-                new object[] { prefabName, spawnPos, Quaternion.identity }, out _);
-
-            if (ok)
+            if (_enemyScanDone)
             {
-                Log.LogInfo($"spawn_enemy: PhotonNetwork.Instantiate('{prefabName}') se llamo sin excepcion.");
+                Log.LogInfo("spawn_enemy: el escaneo ya se hizo en esta sesion, revisa el log anterior.");
+                return;
+            }
+            _enemyScanDone = true;
+
+            const BindingFlags all = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+            Log.LogInfo($"[scan enemigos] pedido: '{enemyName ?? "(ninguno)"}'");
+
+            // 1) La clase Enemy: que campos tiene
+            Type enemyType = FindGameType("Enemy");
+            if (enemyType != null)
+            {
+                Log.LogInfo($"[scan enemigos] tipo Enemy = {enemyType.FullName} (assembly {enemyType.Assembly.GetName().Name}), base = {enemyType.BaseType?.Name}");
+                foreach (var f in enemyType.GetFields(all))
+                    Log.LogInfo($"[scan enemigos] Enemy.{f.Name} : {f.FieldType.Name}");
             }
             else
             {
-                Log.LogWarning($"spawn_enemy: no se pudo instanciar '{prefabName}'. Puede que la ruta de Resources sea otra (probar sin el prefijo 'Enemies/', con mayusculas distintas, etc).");
+                Log.LogWarning("[scan enemigos] no se encontro el tipo 'Enemy'.");
             }
 
-            // Diagnostico de respaldo: listamos cualquier metodo de
-            // EnemyDirector que tenga "spawn" en el nombre, con su firma
-            // completa. Si lo de arriba no funciono, esto nos dice el
-            // camino correcto para la proxima vuelta, en vez de adivinar
-            // a ciegas otra vez.
+            // 2) EnemyDirector: listas/campos con los enemigos disponibles
             var director = FindFirstInstance("EnemyDirector");
             if (director != null)
             {
-                var methods = director.GetType()
-                    .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
-                    .Where(m => m.Name.IndexOf("spawn", StringComparison.OrdinalIgnoreCase) >= 0);
-
-                foreach (var m in methods)
+                foreach (var f in director.GetType().GetFields(all))
                 {
-                    string paramList = string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"));
-                    Log.LogInfo($"[diagnostico spawn_enemy] EnemyDirector tiene: {m.ReturnType.Name} {m.Name}({paramList})");
+                    object val = null;
+                    try { val = f.GetValue(director); } catch { /* ignorar */ }
+
+                    string extra = "";
+                    if (val is System.Collections.IEnumerable en && !(val is string))
+                    {
+                        int n = 0;
+                        var names = new List<string>();
+                        foreach (var item in en)
+                        {
+                            n++;
+                            if (names.Count < 6) names.Add(item != null ? item.ToString() : "null");
+                        }
+                        extra = $" -> {n} elementos: {string.Join(" | ", names)}";
+                    }
+                    Log.LogInfo($"[scan enemigos] EnemyDirector.{f.Name} ({f.FieldType.Name}){extra}");
+                }
+            }
+            else
+            {
+                Log.LogWarning("[scan enemigos] no hay instancia de EnemyDirector (¿estas dentro de una partida?).");
+            }
+
+            // 3) REPOLib: tipos con "enem" en el nombre y sus metodos publicos
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                if (asm.GetName().Name.IndexOf("REPOLib", StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                Type[] types;
+                try { types = asm.GetTypes(); }
+                catch (ReflectionTypeLoadException ex) { types = ex.Types.Where(t => t != null).ToArray(); }
+
+                foreach (var t in types.Where(t => t.Name.IndexOf("enem", StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    Log.LogInfo($"[scan enemigos] REPOLib tipo: {t.FullName}");
+                    foreach (var m in t.GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.Instance | BindingFlags.DeclaredOnly))
+                    {
+                        string paramList = string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"));
+                        Log.LogInfo($"[scan enemigos]   {(m.IsStatic ? "static " : "")}{m.ReturnType.Name} {m.Name}({paramList})");
+                    }
+                    foreach (var p in t.GetProperties(BindingFlags.Public | BindingFlags.Static | BindingFlags.Instance | BindingFlags.DeclaredOnly))
+                        Log.LogInfo($"[scan enemigos]   prop {p.PropertyType.Name} {p.Name}");
                 }
             }
 
-            // EnemyDirector casi no tiene metodos de spawn propios (solo
-            // administra puntos de spawn) - la logica real probablemente
-            // vive en SemiFunc, la clase helper estatica central del juego
-            // (coincide con el nombre "SemiFunc_EnemySpawnPatcher" visto en
-            // el mod de referencia). Escaneamos esa tambien.
+            // 4) Objetos Enemy cargados en memoria (prefabs o ya en escena)
+            if (enemyType != null)
+            {
+                var found = Resources.FindObjectsOfTypeAll(enemyType);
+                Log.LogInfo($"[scan enemigos] objetos Enemy en memoria: {found.Length}");
+                foreach (var o in found.Take(15))
+                {
+                    bool inScene = o is Component c && c.gameObject.scene.IsValid();
+                    Log.LogInfo($"[scan enemigos]   {o.name} (en escena: {inScene})");
+                }
+            }
+
+            // 5) Firma exacta de SemiFunc.EnemySpawn
             Type semiFuncType = FindGameType("SemiFunc");
             if (semiFuncType != null)
             {
-                var semiFuncMethods = semiFuncType
-                    .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
-                    .Where(m => m.Name.IndexOf("spawn", StringComparison.OrdinalIgnoreCase) >= 0
-                             && m.Name.IndexOf("enem", StringComparison.OrdinalIgnoreCase) >= 0);
-
-                foreach (var m in semiFuncMethods)
+                foreach (var m in semiFuncType.GetMethods(all).Where(m => m.Name == "EnemySpawn"))
                 {
-                    string paramList = string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"));
-                    Log.LogInfo($"[diagnostico spawn_enemy] SemiFunc tiene: {m.ReturnType.Name} {m.Name}({paramList})");
+                    string paramList = string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.FullName} {p.Name}"));
+                    Log.LogInfo($"[scan enemigos] SemiFunc.EnemySpawn({paramList}) -> {m.ReturnType.Name}");
                 }
             }
+
+            Log.LogInfo("[scan enemigos] listo. Pasame todas las lineas que empiezan con [scan enemigos].");
         }
 
         private void GiveWeapon(string weaponName)
