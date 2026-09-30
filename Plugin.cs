@@ -480,108 +480,92 @@ namespace FiskLiveREPO
             Log.LogInfo($"Jugador teletransportado con offset {offset} (si no se nota nada, revisar nota de Harmony en el codigo)");
         }
 
-        private static bool _enemyScanDone;
+        // Spawn de enemigos via REPOLib.Modules.Enemies (confirmado por el
+        // escaneo: tiene TryGetEnemyThatContainsName, AllEnemies y SpawnEnemy).
+        // Se usa por reflection para no depender de referenciar el DLL de REPOLib.
+        private static List<UnityEngine.Object> GetEnemyCatalog(Type enemiesType)
+        {
+            var list = new List<UnityEngine.Object>();
+            var prop = enemiesType.GetProperty("AllEnemies", BindingFlags.Public | BindingFlags.Static);
+            if (prop?.GetValue(null, null) is System.Collections.IEnumerable en)
+            {
+                foreach (var item in en)
+                {
+                    if (item is UnityEngine.Object o) list.Add(o);
+                }
+            }
+            return list;
+        }
 
         private void SpawnEnemy(string enemyName)
         {
-            if (_enemyScanDone)
+            Type enemiesType = FindGameType("REPOLib.Modules.Enemies");
+            if (enemiesType == null)
             {
-                Log.LogInfo("spawn_enemy: el escaneo ya se hizo en esta sesion, revisa el log anterior.");
+                Log.LogError("spawn_enemy: no se encontro REPOLib.Modules.Enemies (¿REPOLib esta instalado y cargado?).");
                 return;
             }
-            _enemyScanDone = true;
 
-            const BindingFlags all = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
-            Log.LogInfo($"[scan enemigos] pedido: '{enemyName ?? "(ninguno)"}'");
-
-            // 1) La clase Enemy: que campos tiene
-            Type enemyType = FindGameType("Enemy");
-            if (enemyType != null)
+            // Solo el host de la partida puede spawnear enemigos.
+            Type photonType = FindGameType("PhotonNetwork");
+            var isMaster = photonType?.GetProperty("IsMasterClient", BindingFlags.Public | BindingFlags.Static)?.GetValue(null, null);
+            if (isMaster is bool master && !master)
             {
-                Log.LogInfo($"[scan enemigos] tipo Enemy = {enemyType.FullName} (assembly {enemyType.Assembly.GetName().Name}), base = {enemyType.BaseType?.Name}");
-                foreach (var f in enemyType.GetFields(all))
-                    Log.LogInfo($"[scan enemigos] Enemy.{f.Name} : {f.FieldType.Name}");
+                Log.LogWarning("spawn_enemy: no sos el host de la partida, solo el host puede spawnear enemigos.");
+                return;
+            }
+
+            // 1) Elegir el EnemySetup
+            UnityEngine.Object setup = null;
+            var catalog = GetEnemyCatalog(enemiesType);
+
+            if (string.IsNullOrEmpty(enemyName))
+            {
+                if (catalog.Count > 0) setup = catalog[UnityEngine.Random.Range(0, catalog.Count)];
             }
             else
             {
-                Log.LogWarning("[scan enemigos] no se encontro el tipo 'Enemy'.");
-            }
-
-            // 2) EnemyDirector: listas/campos con los enemigos disponibles
-            var director = FindFirstInstance("EnemyDirector");
-            if (director != null)
-            {
-                foreach (var f in director.GetType().GetFields(all))
+                var tryGet = enemiesType.GetMethod("TryGetEnemyThatContainsName", BindingFlags.Public | BindingFlags.Static);
+                if (tryGet != null)
                 {
-                    object val = null;
-                    try { val = f.GetValue(director); } catch { /* ignorar */ }
-
-                    string extra = "";
-                    if (val is System.Collections.IEnumerable en && !(val is string))
-                    {
-                        int n = 0;
-                        var names = new List<string>();
-                        foreach (var item in en)
-                        {
-                            n++;
-                            if (names.Count < 6) names.Add(item != null ? item.ToString() : "null");
-                        }
-                        extra = $" -> {n} elementos: {string.Join(" | ", names)}";
-                    }
-                    Log.LogInfo($"[scan enemigos] EnemyDirector.{f.Name} ({f.FieldType.Name}){extra}");
-                }
-            }
-            else
-            {
-                Log.LogWarning("[scan enemigos] no hay instancia de EnemyDirector (¿estas dentro de una partida?).");
-            }
-
-            // 3) REPOLib: tipos con "enem" en el nombre y sus metodos publicos
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                if (asm.GetName().Name.IndexOf("REPOLib", StringComparison.OrdinalIgnoreCase) < 0) continue;
-
-                Type[] types;
-                try { types = asm.GetTypes(); }
-                catch (ReflectionTypeLoadException ex) { types = ex.Types.Where(t => t != null).ToArray(); }
-
-                foreach (var t in types.Where(t => t.Name.IndexOf("enem", StringComparison.OrdinalIgnoreCase) >= 0))
-                {
-                    Log.LogInfo($"[scan enemigos] REPOLib tipo: {t.FullName}");
-                    foreach (var m in t.GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.Instance | BindingFlags.DeclaredOnly))
-                    {
-                        string paramList = string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"));
-                        Log.LogInfo($"[scan enemigos]   {(m.IsStatic ? "static " : "")}{m.ReturnType.Name} {m.Name}({paramList})");
-                    }
-                    foreach (var p in t.GetProperties(BindingFlags.Public | BindingFlags.Static | BindingFlags.Instance | BindingFlags.DeclaredOnly))
-                        Log.LogInfo($"[scan enemigos]   prop {p.PropertyType.Name} {p.Name}");
+                    var args = new object[] { enemyName, null };
+                    bool found = (bool)tryGet.Invoke(null, args);
+                    if (found) setup = args[1] as UnityEngine.Object;
                 }
             }
 
-            // 4) Objetos Enemy cargados en memoria (prefabs o ya en escena)
-            if (enemyType != null)
+            if (setup == null)
             {
-                var found = Resources.FindObjectsOfTypeAll(enemyType);
-                Log.LogInfo($"[scan enemigos] objetos Enemy en memoria: {found.Length}");
-                foreach (var o in found.Take(15))
-                {
-                    bool inScene = o is Component c && c.gameObject.scene.IsValid();
-                    Log.LogInfo($"[scan enemigos]   {o.name} (en escena: {inScene})");
-                }
+                Log.LogWarning($"spawn_enemy: no se encontro ningun enemigo que contenga '{enemyName ?? "(al azar)"}'. Enemigos disponibles ({catalog.Count}):");
+                foreach (var o in catalog) Log.LogWarning($"  - {o.name}");
+                return;
             }
 
-            // 5) Firma exacta de SemiFunc.EnemySpawn
-            Type semiFuncType = FindGameType("SemiFunc");
-            if (semiFuncType != null)
+            // 2) Posicion: 4 metros adelante del jugador
+            var player = FindLocalPlayer();
+            var playerTransform = player != null ? TryGetTransform(player) : null;
+            Vector3 spawnPos = playerTransform != null
+                ? playerTransform.position + playerTransform.forward * 4f + Vector3.up * 0.2f
+                : Vector3.zero;
+
+            // 3) Spawnear: SpawnEnemy(EnemySetup, Vector3, Quaternion, bool spawnDespawned)
+            var spawn = enemiesType.GetMethod("SpawnEnemy", BindingFlags.Public | BindingFlags.Static);
+            if (spawn == null)
             {
-                foreach (var m in semiFuncType.GetMethods(all).Where(m => m.Name == "EnemySpawn"))
-                {
-                    string paramList = string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.FullName} {p.Name}"));
-                    Log.LogInfo($"[scan enemigos] SemiFunc.EnemySpawn({paramList}) -> {m.ReturnType.Name}");
-                }
+                Log.LogError("spawn_enemy: REPOLib.Modules.Enemies no tiene el metodo SpawnEnemy.");
+                return;
             }
 
-            Log.LogInfo("[scan enemigos] listo. Pasame todas las lineas que empiezan con [scan enemigos].");
+            try
+            {
+                object result = spawn.Invoke(null, new object[] { setup, spawnPos, Quaternion.identity, false });
+                int count = result is System.Collections.ICollection col ? col.Count : -1;
+                Log.LogInfo($"spawn_enemy: '{setup.name}' spawneado en {spawnPos} (objetos devueltos: {count}).");
+            }
+            catch (Exception ex)
+            {
+                Log.LogError($"spawn_enemy: fallo al spawnear '{setup.name}': {ex.InnerException?.Message ?? ex.Message}");
+            }
         }
 
         private void GiveWeapon(string weaponName)
