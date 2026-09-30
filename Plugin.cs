@@ -497,6 +497,12 @@ namespace FiskLiveREPO
             return list;
         }
 
+        private static object GetStaticProp(Type t, string name)
+        {
+            try { return t?.GetProperty(name, BindingFlags.Public | BindingFlags.Static)?.GetValue(null, null); }
+            catch { return "?"; }
+        }
+
         private void SpawnEnemy(string enemyName)
         {
             Type enemiesType = FindGameType("REPOLib.Modules.Enemies");
@@ -506,14 +512,10 @@ namespace FiskLiveREPO
                 return;
             }
 
-            // Solo el host de la partida puede spawnear enemigos.
+            // Diagnostico: estado de Photon. No bloqueamos nada: si no sos el
+            // host, REPOLib/el juego lo va a rechazar y lo vemos en el log.
             Type photonType = FindGameType("PhotonNetwork");
-            var isMaster = photonType?.GetProperty("IsMasterClient", BindingFlags.Public | BindingFlags.Static)?.GetValue(null, null);
-            if (isMaster is bool master && !master)
-            {
-                Log.LogWarning("spawn_enemy: no sos el host de la partida, solo el host puede spawnear enemigos.");
-                return;
-            }
+            Log.LogInfo($"spawn_enemy: Photon -> IsMasterClient={GetStaticProp(photonType, "IsMasterClient")}, InRoom={GetStaticProp(photonType, "InRoom")}, OfflineMode={GetStaticProp(photonType, "OfflineMode")}");
 
             // 1) Elegir el EnemySetup
             UnityEngine.Object setup = null;
